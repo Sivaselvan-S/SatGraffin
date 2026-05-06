@@ -11,7 +11,7 @@ export function Header() {
         transition={{ duration: 0.5 }}
       >
         <Flame size={16} />
-        Retrieval-Augmented Intelligence
+        AI Research Assistant
       </motion.div>
 
       <motion.h1
@@ -20,7 +20,7 @@ export function Header() {
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.6, delay: 0.1 }}
       >
-        SatGraffin Copilot
+        SatGraffin
       </motion.h1>
 
       <motion.p
@@ -29,7 +29,7 @@ export function Header() {
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.6, delay: 0.2 }}
       >
-        Ask anything about the MOSDAC knowledge base and get traceable, source-backed responses in seconds.
+        Ask any question and get accurate, source-backed answers powered by real-time web search and AI.
       </motion.p>
 
       <motion.div
@@ -39,7 +39,7 @@ export function Header() {
         transition={{ duration: 0.6, delay: 0.3 }}
       >
         <Satellite size={18} />
-        Connected to SatGraffin RAG backend
+        Powered by Web Search + RAG + Gemini AI
       </motion.div>
     </header>
   )

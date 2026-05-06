@@ -1,25 +1,45 @@
-import { useState } from 'react'
-import type { FormEvent } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import type { FormEvent, KeyboardEvent } from 'react'
 import { motion } from 'framer-motion'
 import { ArrowUpRight, Sparkles } from 'lucide-react'
 
 interface ChatInputProps {
   disabled?: boolean
   onSubmit: (message: string) => void
+  initialValue?: string
 }
 
-export function ChatInput({ disabled, onSubmit }: ChatInputProps) {
+export function ChatInput({ disabled, onSubmit, initialValue }: ChatInputProps) {
   const [value, setValue] = useState('')
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    const trimmed = value.trim()
-    if (!trimmed || disabled) {
-      return
+  // Handle external value changes (from prompt clicks)
+  useEffect(() => {
+    if (initialValue) {
+      setValue(initialValue)
+      textareaRef.current?.focus()
     }
+  }, [initialValue])
 
+  // Auto-resize textarea
+  useEffect(() => {
+    const textarea = textareaRef.current
+    if (textarea) {
+      textarea.style.height = 'auto'
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`
+    }
+  }, [value])
+
+  // central send function
+  const send = () => {
+    const trimmed = value.trim()
+    if (!trimmed || disabled) return
     onSubmit(trimmed)
     setValue('')
+  }
+  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    send()
   }
 
   return (
@@ -31,9 +51,16 @@ export function ChatInput({ disabled, onSubmit }: ChatInputProps) {
     >
       <div className="chat-input__wrapper">
         <textarea
+          ref={textareaRef}
           value={value}
           onChange={(event) => setValue(event.target.value)}
-          placeholder="Ask me about satellites, payload specs, data access or anything MOSDAC offers..."
+          onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault()
+              send()
+            }
+          }}
+          placeholder="Ask me anything — I'll search the web and provide sourced answers..."
           rows={1}
           className="chat-input__textarea"
           disabled={disabled}
@@ -42,7 +69,7 @@ export function ChatInput({ disabled, onSubmit }: ChatInputProps) {
           <button
             type="button"
             className="chat-input__suggest"
-            onClick={() => setValue('Summarise the key missions hosted on MOSDAC and their primary objectives.')}
+            onClick={() => setValue('What are the key breakthroughs in AI research this year?')}
             disabled={disabled}
           >
             <Sparkles size={14} />

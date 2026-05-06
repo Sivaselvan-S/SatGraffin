@@ -7,9 +7,13 @@ export interface ChatMessage {
   createdAt: number;
   sources?: string[];
   isError?: boolean;
+  isAmbiguous?: boolean;
+  disambiguationOptions?: string[];
 }
 
 export interface QueryResponse {
   response: string;
   source_links?: string[];
+  is_ambiguous?: boolean;
+  disambiguation_options?: string[];
 }
