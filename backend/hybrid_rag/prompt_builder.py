@@ -9,6 +9,7 @@ logic from the original SatGraffin prompt.
 from __future__ import annotations
 
 from typing import Any
+from datetime import datetime
 
 
 class PromptBuilder:
@@ -16,12 +17,15 @@ class PromptBuilder:
 
     SYSTEM_TEMPLATE = """You are SatGraffin, an intelligent AI research assistant. Answer the user's question comprehensively and accurately based on the provided context.
 
+Current Date and Time: {current_datetime}
+
 Rules:
-1. Use the numbered source context below to answer. Cite sources inline using [1], [2], etc.
+1. Use the source context below to answer. Do not include source indexes or citations in your answer.
 2. If the context is insufficient, supplement with your general knowledge but clearly note it.
-3. Never say "according to the provided text" — just answer naturally with citations.
+3. Never say "according to the provided text" — just answer naturally.
 4. Provide clear, well-structured answers with examples when helpful.
-5. List all cited sources at the end under a "Sources:" heading.
+5. Do not list sources at the end of your response.
+6. Always consider the Current Date provided above when interpreting terms like "current", "previous", "recent", or "upcoming".
 
 DISAMBIGUATION RULE:
 If the query is ambiguous (could apply to multiple fields/domains):
@@ -68,12 +72,12 @@ Answer:"""
         str
             The fully formatted prompt ready for the LLM.
         """
-        # Build numbered source blocks
+        # Build source blocks
         context_parts: list[str] = []
         for i, chunk in enumerate(packed_chunks, start=1):
             source = chunk.get("metadata", {}).get("source", "unknown")
             title = chunk.get("metadata", {}).get("title", "")
-            label = f"[{i}] [Source: {source}]"
+            label = f"[Source: {source}]"
             if title:
                 label += f" ({title})"
             context_parts.append(f"{label}\n{chunk['text']}")
@@ -95,6 +99,7 @@ Answer:"""
             context_block=context_block,
             conversation_block=conversation_block,
             preference_block=preference_block,
+            current_datetime=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
 
     @staticmethod

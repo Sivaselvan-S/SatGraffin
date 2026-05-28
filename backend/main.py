@@ -197,6 +197,12 @@ class SetContextRequest(BaseModel):
     user_id: str
     selected_context: str
 
+class FeedbackRequest(BaseModel):
+    query: str
+    answer: str
+    source_links: list[str]
+    is_thumbs_up: bool
+
 
 # =============================================================================
 # WEB SEARCH MODULE (Using DuckDuckGo)
@@ -635,7 +641,7 @@ Rules:
 3. Never say "according to the provided text" or "based on the context" - just answer naturally.
 4. Provide clear, well-structured answers with examples when helpful.
 5. For factual questions, be accurate and informative.
-6. If you cite sources, mention them at the end.
+6. Do not include source indexes, citations, or list sources in your answer.
 
 DISAMBIGUATION RULE:
 If the query is ambiguous or general (could apply to multiple fields/domains), structure your response as follows:
@@ -880,11 +886,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from hybrid_rag.feedback_loop import FeedbackLoop
+
 # Global instances
 web_searcher = WebSearcher()
 scraper = DynamicScraper()
 knowledge_base = KnowledgeBase()
 executor = ThreadPoolExecutor(max_workers=4)  # Thread pool for blocking I/O
+feedback_loop_mgr = FeedbackLoop()
 
 
 @app.get("/")
@@ -907,15 +916,14 @@ def health_check():
     }
 
 
-@lru_cache(maxsize=100)
-def generate_search_query(user_query: str) -> str:
-    """
-    Refine the user query for better search results.
-    Cached to avoid reprocessing identical queries.
-    """
-    # Remove common question words that don't help search
-    cleaned = re.sub(r"^(what is|who is|how to|why does|when did|where is|can you|tell me about)\s+", "", user_query.lower(), flags=re.IGNORECASE)
-    return cleaned.strip() or user_query
+query_analyzer_instance = None
+
+def get_query_analyzer():
+    global query_analyzer_instance
+    if query_analyzer_instance is None and knowledge_base.llm is not None:
+        from hybrid_rag.query_analyzer import QueryAnalyzer
+        query_analyzer_instance = QueryAnalyzer(llm=knowledge_base.llm)
+    return query_analyzer_instance
 
 
 @app.post("/api/query", response_model=QueryResponse)
@@ -940,11 +948,31 @@ async def process_query(request: QueryRequest, background_tasks: BackgroundTasks
     
     loop = asyncio.get_event_loop()
     
-    # Step 1: Search the web (run in thread pool)
-    search_query = generate_search_query(user_query)
-    search_results = await loop.run_in_executor(
-        executor, web_searcher.search, search_query, MAX_SEARCH_RESULTS
-    )
+    # Analyze Query using LLM
+    conversation_context = get_conversation_context(user_id) if user_id else ""
+    context_preference = get_context_preference(user_id) if user_id else None
+    
+    analyzer = get_query_analyzer()
+    if analyzer:
+        analysis = await loop.run_in_executor(
+            executor, analyzer.analyze, user_query, conversation_context
+        )
+        search_query = analysis.optimized_search_query
+        requires_web_search = analysis.requires_web_search
+        logger.info(f"Query Analysis: {analysis}")
+    else:
+        search_query = user_query
+        requires_web_search = True
+        logger.warning("QueryAnalyzer not ready, falling back to raw query")
+        
+    if requires_web_search:
+        # Step 1: Search the web (run in thread pool)
+        search_results = await loop.run_in_executor(
+            executor, web_searcher.search, search_query, MAX_SEARCH_RESULTS
+        )
+    else:
+        search_results = []
+        logger.info("Skipping web search based on Query Analysis")
     
     if not search_results:
         logger.warning("No search results found, querying existing knowledge base")
@@ -982,9 +1010,7 @@ async def process_query(request: QueryRequest, background_tasks: BackgroundTasks
         
         logger.info(f"Scraped and indexed {scraped_count} pages")
     
-    # Step 3: Build query with conversation context and context preference
-    conversation_context = get_conversation_context(user_id) if user_id else ""
-    context_preference = get_context_preference(user_id) if user_id else None
+    # Step 3: Conversation context already fetched, context preference already fetched
     
     # Step 4: Hybrid RAG query (BM25 + FAISS → RRF → cross-encoder → context pack → LLM)
     result = await loop.run_in_executor(
@@ -1127,6 +1153,38 @@ def clear_context(user_id: str):
     try:
         clear_context_preference(user_id)
         return {"status": "ok", "message": "Context preference cleared"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/api/feedback")
+def submit_feedback(request: FeedbackRequest):
+    """Submit thumbs up/down feedback for a specific answer."""
+    try:
+        feedback_loop_mgr.submit_feedback(
+            query=request.query,
+            answer=request.answer,
+            source_links=request.source_links,
+            is_thumbs_up=request.is_thumbs_up
+        )
+        return {"status": "ok", "message": "Feedback submitted successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/api/optimize-sources")
+def optimize_sources():
+    """Run the MLOps background job to adjust domain trust scores based on feedback."""
+    try:
+        global TRUSTED_DOMAINS
+        updated_domains = feedback_loop_mgr.run_optimization_job(TRUSTED_DOMAINS)
+        TRUSTED_DOMAINS.clear()
+        TRUSTED_DOMAINS.update(updated_domains)
+        return {
+            "status": "ok", 
+            "message": "Optimization completed. Domain scores updated.",
+            "trusted_domains": TRUSTED_DOMAINS
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
