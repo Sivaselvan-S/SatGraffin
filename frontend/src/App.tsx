@@ -94,6 +94,7 @@ function App() {
 
       const data = (await response.json()) as QueryResponse
       const assistantMessage = createMessage('assistant', data.response, data.source_links ?? [])
+      assistantMessage.query = trimmed
       
       // Add disambiguation info if present
       if (data.is_ambiguous && data.disambiguation_options) {
@@ -159,6 +160,24 @@ function App() {
     setMessages([DEFAULT_ASSISTANT_MESSAGE])
   }
 
+  const handleFeedback = async (message: ChatMessage, isThumbsUp: boolean) => {
+    if (!message.query) return;
+    try {
+      await fetch(`${API_BASE_URL}/api/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: message.query,
+          answer: message.content,
+          source_links: message.sources || [],
+          is_thumbs_up: isThumbsUp
+        }),
+      });
+    } catch (err) {
+      console.error('Failed to submit feedback', err);
+    }
+  };
+
   return (
     <div className="app-shell">
       <div className="app-shell__background" aria-hidden />
@@ -178,6 +197,7 @@ function App() {
                     message={message} 
                     onRetry={message.isError ? handleRetry : undefined}
                     onContextSelect={handleContextSelect}
+                    onFeedback={handleFeedback}
                   />
                 ))}
               </AnimatePresence>

@@ -9,6 +9,7 @@ export interface ChatMessage {
   isError?: boolean;
   isAmbiguous?: boolean;
   disambiguationOptions?: string[];
+  query?: string;
 }
 
 export interface QueryResponse {

@@ -1,6 +1,6 @@
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
-import { Bot, UserRound, Copy, Check, RotateCcw } from 'lucide-react'
+import { Bot, UserRound, Copy, Check, RotateCcw, ThumbsUp, ThumbsDown } from 'lucide-react'
 import clsx from 'clsx'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -12,15 +12,24 @@ interface MessageBubbleProps {
   message: ChatMessage
   onRetry?: (content: string) => void
   onContextSelect?: (context: string) => void
+  onFeedback?: (message: ChatMessage, isThumbsUp: boolean) => void
 }
 
 export const MessageBubble = memo(function MessageBubble({ 
   message, 
   onRetry,
-  onContextSelect 
+  onContextSelect,
+  onFeedback
 }: MessageBubbleProps) {
   const isUser = message.role === 'user'
   const [copied, setCopied] = useState(false)
+  const [feedbackState, setFeedbackState] = useState<'up' | 'down' | null>(null)
+
+  const handleFeedbackClick = (isUp: boolean) => {
+    if (feedbackState) return;
+    setFeedbackState(isUp ? 'up' : 'down');
+    onFeedback?.(message, isUp);
+  }
 
   const handleCopy = async () => {
     try {
@@ -100,6 +109,32 @@ export const MessageBubble = memo(function MessageBubble({
               {copied ? <Check size={14} /> : <Copy size={14} />}
               {copied ? 'Copied' : 'Copy'}
             </button>
+            
+            {message.query && !message.isError && (
+               <div style={{ display: 'flex', gap: '4px' }}>
+                 <button
+                   type="button"
+                   className="message__action-btn"
+                   style={{ color: feedbackState === 'up' ? '#10b981' : undefined }}
+                   onClick={() => handleFeedbackClick(true)}
+                   disabled={feedbackState !== null}
+                   title="Good answer"
+                 >
+                   <ThumbsUp size={14} />
+                 </button>
+                 <button
+                   type="button"
+                   className="message__action-btn"
+                   style={{ color: feedbackState === 'down' ? '#ef4444' : undefined }}
+                   onClick={() => handleFeedbackClick(false)}
+                   disabled={feedbackState !== null}
+                   title="Bad answer"
+                 >
+                   <ThumbsDown size={14} />
+                 </button>
+               </div>
+            )}
+
             {message.isError && onRetry && (
               <button
                 type="button"
