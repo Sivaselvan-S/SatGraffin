@@ -562,7 +562,7 @@ class KnowledgeBase:
                 logger.info("Semantic chunking not available. Using regular chunking.")
             
             # Load or create vector store
-            if os.path.exists(VECTOR_STORE_PATH):
+            if os.path.exists(os.path.join(VECTOR_STORE_PATH, "index.faiss")):
                 logger.info("Loading existing vector store...")
                 self.vector_store = FAISS.load_local(
                     VECTOR_STORE_PATH,
