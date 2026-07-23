@@ -2,18 +2,19 @@ import { useEffect, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import { motion } from 'framer-motion'
 import { ArrowUpRight, Sparkles } from 'lucide-react'
+import { FileUpload } from './FileUpload'
 
 interface ChatInputProps {
   disabled?: boolean
-  onSubmit: (message: string) => void
+  onSubmit: (message: string, file?: File) => void
   initialValue?: string
 }
 
 export function ChatInput({ disabled, onSubmit, initialValue }: ChatInputProps) {
   const [value, setValue] = useState('')
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-  // Handle external value changes (from prompt clicks)
   useEffect(() => {
     if (initialValue) {
       setValue(initialValue)
@@ -21,7 +22,6 @@ export function ChatInput({ disabled, onSubmit, initialValue }: ChatInputProps) 
     }
   }, [initialValue])
 
-  // Auto-resize textarea
   useEffect(() => {
     const textarea = textareaRef.current
     if (textarea) {
@@ -30,13 +30,14 @@ export function ChatInput({ disabled, onSubmit, initialValue }: ChatInputProps) 
     }
   }, [value])
 
-  // central send function
   const send = () => {
     const trimmed = value.trim()
-    if (!trimmed || disabled) return
-    onSubmit(trimmed)
+    if ((!trimmed && !selectedFile) || disabled) return
+    onSubmit(trimmed, selectedFile || undefined)
     setValue('')
+    setSelectedFile(null)
   }
+
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     send()
@@ -60,12 +61,17 @@ export function ChatInput({ disabled, onSubmit, initialValue }: ChatInputProps) 
               send()
             }
           }}
-          placeholder="Ask me anything — I'll search the web and provide sourced answers..."
+          placeholder="Ask me anything — I'll search the web, analyze documents, and stream sourced answers..."
           rows={1}
           className="chat-input__textarea"
           disabled={disabled}
         />
         <div className="chat-input__actions">
+          <FileUpload
+            selectedFile={selectedFile}
+            onFileSelect={setSelectedFile}
+            disabled={disabled}
+          />
           <button
             type="button"
             className="chat-input__suggest"
@@ -75,7 +81,11 @@ export function ChatInput({ disabled, onSubmit, initialValue }: ChatInputProps) 
             <Sparkles size={14} />
             Inspire me
           </button>
-          <button type="submit" className="chat-input__submit" disabled={disabled || value.trim().length === 0}>
+          <button
+            type="submit"
+            className="chat-input__submit"
+            disabled={disabled || (value.trim().length === 0 && !selectedFile)}
+          >
             Send
             <ArrowUpRight size={16} />
           </button>

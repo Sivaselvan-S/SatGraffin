@@ -1,5 +1,10 @@
 export type ChatRole = 'user' | 'assistant';
 
+export interface ThinkingStep {
+  step: string;
+  message: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -10,6 +15,9 @@ export interface ChatMessage {
   isAmbiguous?: boolean;
   disambiguationOptions?: string[];
   query?: string;
+  thinkingSteps?: ThinkingStep[];
+  imageUrl?: string;
+  isStreaming?: boolean;
 }
 
 export interface QueryResponse {

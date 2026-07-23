@@ -26,7 +26,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -53,6 +54,13 @@ from hybrid_rag.rrf_fusion import reciprocal_rank_fusion
 from hybrid_rag.cross_encoder_reranker import CrossEncoderReranker
 from hybrid_rag.context_packer import ContextPacker
 from hybrid_rag.prompt_builder import PromptBuilder
+from hybrid_rag.hyde import HyDEGenerator
+from hybrid_rag.crag_validator import CRAGValidator
+from hybrid_rag.query_decomposer import QueryDecomposer
+from hybrid_rag.multimodal_processor import MultimodalProcessor
+from hybrid_rag.knowledge_graph import KnowledgeGraphStore
+from hybrid_rag.tracer import PipelineTracer, get_recent_traces
+from hybrid_rag.local_query_analyzer import LocalQueryAnalyzer
 
 # Load environment variables
 load_dotenv()
@@ -67,6 +75,9 @@ GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 CACHE_DURATION_HOURS = int(os.getenv("CACHE_DURATION_HOURS", "6"))
 MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
 MAX_SCRAPE_PAGES = int(os.getenv("MAX_SCRAPE_PAGES", "3"))
+# API Saver Mode: skip LLM calls for QueryAnalyzer, HyDE, and CRAG — use local CPU alternatives.
+# Set API_SAVER_MODE=false in .env to restore full Gemini pipeline.
+API_SAVER_MODE = os.getenv("API_SAVER_MODE", "true").strip().lower() in ("1", "true", "yes")
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -75,6 +86,20 @@ logger = logging.getLogger("satgraffin")
 # --- Ensure directories exist ---
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+# Startup banner
+logger.info(
+    "🚀 SatGraffin starting | RAG_MODE=%s | model=%s",
+    "Normal mode (Quota Saver)" if API_SAVER_MODE else "DiveX mode (Deep RAG)",
+    GEMINI_MODEL_NAME,
+)
+if API_SAVER_MODE:
+    logger.info(
+        "⚡ Normal mode ACTIVE — Local CPU QueryAnalyzer, HyDE expander & CRAG. "
+        "Only 1 Gemini call per query."
+    )
+else:
+    logger.info("🤿 DiveX mode ACTIVE — Full multi-agent LLM HyDE, CRAG grading & query analysis (4 calls/query).")
 
 # --- Source Quality Scoring ---
 # Domains are scored for trustworthiness (higher = more trusted)
@@ -171,10 +196,43 @@ def clear_context_preference(user_id: str):
 # DATA MODELS
 # =============================================================================
 
+AVAILABLE_MODELS = [
+    {
+        "id": "gemini-2.0-flash",
+        "name": "Gemini 2.0 Flash",
+        "tag": "Recommended",
+        "description": "Ultra-fast multimodal reasoning model optimized for RAG",
+        "badge": "Default & Fast"
+    },
+    {
+        "id": "gemini-2.5-flash",
+        "name": "Gemini 2.5 Flash",
+        "tag": "Advanced Reasoning",
+        "description": "Enhanced reasoning engine (Free tier: 20 requests/day)",
+        "badge": "High Intellect"
+    },
+    {
+        "id": "gemini-1.5-pro",
+        "name": "Gemini 1.5 Pro",
+        "tag": "Deep Research",
+        "description": "2M token context window for complex synthesis",
+        "badge": "Deep Research"
+    },
+    {
+        "id": "gemini-2.5-pro",
+        "name": "Gemini 2.5 Pro",
+        "tag": "Flagship Pro",
+        "description": "Top-tier flagship reasoning model for technical tasks",
+        "badge": "Flagship"
+    }
+]
+
+
 class QueryRequest(BaseModel):
     query: str
     user_id: Optional[str] = None
     force_refresh: bool = False
+    model: Optional[str] = None
 
 
 class SourceDocument(BaseModel):
@@ -196,6 +254,11 @@ class QueryResponse(BaseModel):
 class SetContextRequest(BaseModel):
     user_id: str
     selected_context: str
+
+
+class SetModelRequest(BaseModel):
+    model: str
+
 
 class FeedbackRequest(BaseModel):
     query: str
@@ -530,6 +593,43 @@ class KnowledgeBase:
         self.cross_encoder = CrossEncoderReranker()
         self.context_packer = ContextPacker(max_tokens=3000, jaccard_threshold=0.85)
         self.prompt_builder = PromptBuilder()
+        self.hyde_generator = None
+        self.crag_validator = None
+        self.multimodal_processor = None
+        self.knowledge_graph = KnowledgeGraphStore(storage_path=DATA_DIR / "knowledge_graph.json")
+        self.current_model = GEMINI_MODEL_NAME
+    
+    def set_model(self, model_name: str) -> bool:
+        """Dynamically switch Gemini model across all hybrid RAG components."""
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        if not google_api_key:
+            return False
+        try:
+            logger.info(f"Switching Gemini model to: {model_name}")
+            new_llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                temperature=0.2,
+                google_api_key=google_api_key,
+                transport="rest",
+                max_retries=2
+            )
+            self.llm = new_llm
+            self.current_model = model_name
+            self.hyde_generator = HyDEGenerator(llm=self.llm)
+            self.crag_validator = CRAGValidator(llm=self.llm)
+            self.multimodal_processor = MultimodalProcessor(llm=self.llm)
+            self._rebuild_qa_chain()
+
+            # Invalidate cached query analyzer instances so they rebuild with new LLM
+            global query_analyzer_instance, query_decomposer_instance
+            query_analyzer_instance = None
+            query_decomposer_instance = None
+
+            logger.info(f"Successfully switched LLM model to {model_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to switch model to {model_name}: {e}")
+            return False
     
     def initialize(self) -> bool:
         """Initialize embeddings, vector store, BM25 index, and LLM."""
@@ -564,12 +664,21 @@ class KnowledgeBase:
             # Load or create vector store
             if os.path.exists(os.path.join(VECTOR_STORE_PATH, "index.faiss")):
                 logger.info("Loading existing vector store...")
-                self.vector_store = FAISS.load_local(
-                    VECTOR_STORE_PATH,
-                    self.embeddings,
-                    allow_dangerous_deserialization=True
-                )
-                self._load_indexed_urls()
+                try:
+                    self.vector_store = FAISS.load_local(
+                        VECTOR_STORE_PATH,
+                        self.embeddings,
+                        allow_dangerous_deserialization=True
+                    )
+                    self._load_indexed_urls()
+                except Exception as e:
+                    logger.warning(f"Existing vector store is corrupted or unreadable ({e}). Recreating fresh vector store...")
+                    placeholder = Document(
+                        page_content="SatGraffin knowledge base initialized.",
+                        metadata={"source": "system", "type": "placeholder"}
+                    )
+                    self.vector_store = FAISS.from_documents([placeholder], self.embeddings)
+                    self.vector_store.save_local(VECTOR_STORE_PATH)
             else:
                 logger.info("Creating new vector store...")
                 placeholder = Document(
@@ -585,19 +694,26 @@ class KnowledgeBase:
                 self._rebuild_bm25_from_faiss()
             
             # Initialize LLM
-            logger.info(f"Initializing Gemini model: {GEMINI_MODEL_NAME}")
+            logger.info(f"Initializing Gemini model: {self.current_model}")
             self.llm = ChatGoogleGenerativeAI(
-                model=GEMINI_MODEL_NAME,
+                model=self.current_model,
                 temperature=0.2,
                 google_api_key=google_api_key,
-                transport="rest"
+                transport="rest",
+                max_retries=2
             )
+
+            # Initialize HyDE, CRAG, and Multimodal
+            self.hyde_generator = HyDEGenerator(llm=self.llm)
+            self.crag_validator = CRAGValidator(llm=self.llm)
+            self.multimodal_processor = MultimodalProcessor(llm=self.llm)
             
             # Build legacy QA chain (kept for benchmark comparison)
             self._rebuild_qa_chain()
             
-            logger.info("Knowledge base initialized successfully (Hybrid RAG enabled)")
+            logger.info("Knowledge base initialized successfully (Agentic Hybrid RAG v3.0 enabled)")
             return True
+
             
         except Exception as e:
             logger.exception(f"Failed to initialize knowledge base: {e}")
@@ -775,37 +891,65 @@ Answer:"""
             }
         
         try:
-            # --- Step 1: Dual retrieval ---
-            # FAISS dense search
+            # --- Step 1: 3-Lane Retrieval (FAISS + HyDE FAISS + BM25) ---
+            # Lane A: Direct FAISS dense search
             faiss_docs_with_scores = self.vector_store.similarity_search_with_score(question, k=20)
-            faiss_results = []
-            for doc, score in faiss_docs_with_scores:
-                faiss_results.append({
-                    "text": doc.page_content,
-                    "metadata": doc.metadata,
-                    "faiss_score": float(score),
-                })
+            faiss_results = [
+                {"text": doc.page_content, "metadata": doc.metadata, "faiss_score": float(score)}
+                for doc, score in faiss_docs_with_scores
+            ]
             
-            # BM25 sparse search
+            # Lane B: HyDE FAISS dense search
+            hyde_results = []
+            if self.hyde_generator:
+                if API_SAVER_MODE:
+                    # Local keyword expansion — zero API call, < 0.5 ms
+                    hyde_doc = self.hyde_generator.expand_query(question)
+                else:
+                    # Full LLM HyDE generation (1 Gemini call)
+                    hyde_doc = self.hyde_generator.generate_hypothetical_doc(question)
+                if hyde_doc and hyde_doc != question:
+                    hyde_docs_scores = self.vector_store.similarity_search_with_score(hyde_doc, k=20)
+                    hyde_results = [
+                        {"text": doc.page_content, "metadata": doc.metadata, "hyde_score": float(score)}
+                        for doc, score in hyde_docs_scores
+                    ]
+
+            # Lane C: BM25 sparse search
             bm25_results = self.bm25_retriever.search(question, top_k=20)
             
-            logger.info(f"Dual retrieval: FAISS={len(faiss_results)}, BM25={len(bm25_results)}")
+            logger.info(f"3-Lane Retrieval: FAISS={len(faiss_results)}, HyDE={len(hyde_results)}, BM25={len(bm25_results)}")
             
             # --- Step 2: RRF Fusion ---
-            fused = reciprocal_rank_fusion(
-                [bm25_results, faiss_results], k=60, top_n=20
-            )
+            search_lanes = [bm25_results, faiss_results]
+            if hyde_results:
+                search_lanes.append(hyde_results)
+            
+            fused = reciprocal_rank_fusion(search_lanes, k=60, top_n=20)
             logger.info(f"RRF fusion produced {len(fused)} candidates")
             
             # --- Step 3: Cross-encoder re-ranking ---
-            reranked = self.cross_encoder.rerank(question, fused, top_k=5)
-            logger.info(f"Cross-encoder re-ranked to {len(reranked)} results")
+            reranked = self.cross_encoder.rerank(question, fused, top_k=8)
+            logger.info(f"Cross-encoder re-ranked to {len(reranked)} candidates")
+
+            # --- Step 4: CRAG Relevance Grading ---
+            crag_result = {"filtered_chunks": reranked, "action": "CORRECT", "refined_query": None}
+            if self.crag_validator:
+                if API_SAVER_MODE:
+                    # Local ce_score threshold — zero API call, < 0.1 ms
+                    crag_result = self.crag_validator.local_evaluate(question, reranked)
+                else:
+                    # Full LLM CRAG evaluation (1 Gemini call)
+                    crag_result = self.crag_validator.evaluate(question, reranked)
             
-            # --- Step 4: Context packing ---
-            packed = self.context_packer.pack(reranked)
+            validated_chunks = crag_result["filtered_chunks"][:5]
+            logger.info(f"CRAG validated {len(validated_chunks)} relevant chunks")
+            
+            # --- Step 5: Context packing ---
+            packed = self.context_packer.pack(validated_chunks)
             logger.info(f"Context packer selected {len(packed)} chunks")
             
-            # --- Step 5: Build prompt and call LLM ---
+            # --- Step 6: Build prompt and call LLM ---
             prompt = self.prompt_builder.build(
                 query=question,
                 packed_chunks=packed,
@@ -826,6 +970,8 @@ Answer:"""
                 "result": answer_text,
                 "source_documents": source_docs,
                 "packed_chunks": packed,
+                "crag_action": crag_result.get("action"),
+                "crag_refined_query": crag_result.get("refined_query")
             }
             
         except Exception as e:
@@ -861,19 +1007,30 @@ Answer:"""
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
-    # Startup
+    # --- Startup: validate critical env vars before loading anything ---
+    google_api_key = os.getenv("GOOGLE_API_KEY", "")
+    if not google_api_key:
+        logger.critical(
+            "\n" + "=" * 60 +
+            "\n  GOOGLE_API_KEY is not set!" +
+            "\n  Copy .env.example to .env and add your API key." +
+            "\n  The server will start but all queries will fail." +
+            "\n" + "=" * 60
+        )
+
     success = knowledge_base.initialize()
     if not success:
-        logger.error("Failed to initialize knowledge base - check your API key")
+        logger.error("Failed to initialize knowledge base - check GOOGLE_API_KEY in .env")
     yield
     # Shutdown (cleanup if needed)
+    executor.shutdown(wait=False)
     logger.info("Shutting down SatGraffin API")
 
 
 app = FastAPI(
     title="SatGraffin API",
-    description="General-purpose AI research assistant that searches the web and provides grounded answers.",
-    version="2.0.0",
+    description="Industrial Agentic RAG research assistant with real-time streaming, HyDE, CRAG, and multimodal reasoning.",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -892,8 +1049,12 @@ from hybrid_rag.feedback_loop import FeedbackLoop
 web_searcher = WebSearcher()
 scraper = DynamicScraper()
 knowledge_base = KnowledgeBase()
-executor = ThreadPoolExecutor(max_workers=4)  # Thread pool for blocking I/O
+# Thread pool for blocking I/O operations (scraping, embeddings, disk I/O).
+# Pipeline uses: QueryAnalyzer + web search + up to 3 scrapes + 3 add_content +
+# hybrid_query = up to 9 concurrent blocking tasks. 10 workers is comfortable.
+executor = ThreadPoolExecutor(max_workers=10)
 feedback_loop_mgr = FeedbackLoop()
+
 
 
 @app.get("/")
@@ -902,7 +1063,7 @@ def root():
     return {
         "status": "ok",
         "message": "SatGraffin API is running",
-        "version": "2.0.0"
+        "version": "3.0.0"
     }
 
 
@@ -917,13 +1078,27 @@ def health_check():
 
 
 query_analyzer_instance = None
+query_decomposer_instance = None
+_local_query_analyzer = LocalQueryAnalyzer()  # instantiated once — no model load, < 1 ms
 
 def get_query_analyzer():
+    """Return the appropriate query analyzer based on API_SAVER_MODE."""
     global query_analyzer_instance
+    if API_SAVER_MODE:
+        # Local analyzer: pure Python, zero API calls, < 1 ms
+        return _local_query_analyzer
+    # Full LLM-based analyzer (1 Gemini call)
     if query_analyzer_instance is None and knowledge_base.llm is not None:
         from hybrid_rag.query_analyzer import QueryAnalyzer
         query_analyzer_instance = QueryAnalyzer(llm=knowledge_base.llm)
     return query_analyzer_instance
+
+def get_query_decomposer():
+    """Lazy getter for the standalone QueryDecomposer — used as fallback when QueryAnalyzer is unavailable."""
+    global query_decomposer_instance
+    if query_decomposer_instance is None and knowledge_base.llm is not None:
+        query_decomposer_instance = QueryDecomposer(llm=knowledge_base.llm)
+    return query_decomposer_instance
 
 
 @app.post("/api/query", response_model=QueryResponse)
@@ -952,26 +1127,56 @@ async def process_query(request: QueryRequest, background_tasks: BackgroundTasks
     conversation_context = get_conversation_context(user_id) if user_id else ""
     context_preference = get_context_preference(user_id) if user_id else None
     
+    search_queries = []
+    requires_web_search = True
+    
     analyzer = get_query_analyzer()
     if analyzer:
         analysis = await loop.run_in_executor(
             executor, analyzer.analyze, user_query, conversation_context
         )
-        search_query = analysis.optimized_search_query
         requires_web_search = analysis.requires_web_search
+        if analysis.is_complex and analysis.sub_queries:
+            search_queries = analysis.sub_queries
+            logger.info(f"Decomposed query into {len(search_queries)} sub-queries: {search_queries}")
+        else:
+            search_queries = [analysis.optimized_search_query]
         logger.info(f"Query Analysis: {analysis}")
     else:
-        search_query = user_query
+        # QueryAnalyzer not ready — try QueryDecomposer as a lightweight fallback
+        decomposer = get_query_decomposer()
+        if decomposer:
+            decomp = await loop.run_in_executor(
+                executor, decomposer.decompose, user_query, conversation_context
+            )
+            if decomp.is_complex and decomp.sub_queries:
+                search_queries = [sq.query for sq in decomp.sub_queries]
+                logger.info(f"QueryDecomposer fallback: {len(search_queries)} sub-queries: {search_queries}")
+            else:
+                search_queries = [user_query]
+        else:
+            search_queries = [user_query]
         requires_web_search = True
-        logger.warning("QueryAnalyzer not ready, falling back to raw query")
+        logger.warning("QueryAnalyzer not ready, used QueryDecomposer fallback")
+
         
-    if requires_web_search:
-        # Step 1: Search the web (run in thread pool)
-        search_results = await loop.run_in_executor(
-            executor, web_searcher.search, search_query, MAX_SEARCH_RESULTS
-        )
+    search_results = []
+    if requires_web_search and search_queries:
+        # Step 1: Search the web for all sub-queries in parallel
+        search_tasks = [
+            loop.run_in_executor(executor, web_searcher.search, sq, MAX_SEARCH_RESULTS)
+            for sq in search_queries
+        ]
+        results_lists = await asyncio.gather(*search_tasks, return_exceptions=True)
+        seen_urls = set()
+        for res_list in results_lists:
+            if isinstance(res_list, list):
+                for item in res_list:
+                    u = item.get("url")
+                    if u and u not in seen_urls:
+                        seen_urls.add(u)
+                        search_results.append(item)
     else:
-        search_results = []
         logger.info("Skipping web search based on Query Analysis")
     
     if not search_results:
@@ -984,31 +1189,56 @@ async def process_query(request: QueryRequest, background_tasks: BackgroundTasks
             reverse=True
         )
         
-        # Step 2: Scrape top results and add to knowledge base
+        # Step 2: Scrape top results IN PARALLEL and add to knowledge base
+        urls_to_scrape = [
+            result.get("url", "")
+            for result in search_results[:MAX_SCRAPE_PAGES]
+            if result.get("url", "")
+        ]
+
+        # Fan-out: kick off all scrapes simultaneously
+        scrape_tasks = [
+            loop.run_in_executor(executor, scraper.scrape, url, request.force_refresh)
+            for url in urls_to_scrape
+        ]
+        scrape_results_raw = await asyncio.gather(*scrape_tasks, return_exceptions=True)
+
+        # Build a lookup so we can match scraped content back to the original result
+        url_to_result = {r.get("url", ""): r for r in search_results}
+
+        # Index each page — add_content does disk I/O so push it to the executor too
         scraped_count = 0
-        for result in search_results[:MAX_SCRAPE_PAGES]:
-            url = result.get("url", "")
-            if not url:
-                continue
-            
-            # Run scraping in thread pool
-            scraped = await loop.run_in_executor(
-                executor, scraper.scrape, url, request.force_refresh
+
+        async def _index_page(url: str, scraped: dict) -> int:
+            """Run knowledge_base.add_content in the thread pool (non-blocking)."""
+            original = url_to_result.get(url, {})
+            meta = {
+                "source": url,
+                "title": scraped.get("title") or original.get("title", ""),
+                "search_query": search_queries[0] if search_queries else user_query,
+                "scraped_at": datetime.now().isoformat(),
+                "quality_score": score_source(url),
+            }
+            return await loop.run_in_executor(
+                executor, knowledge_base.add_content, scraped["content"], meta
             )
-            if scraped and scraped.get("content"):
-                # Add to knowledge base with quality score
-                metadata = {
-                    "source": url,
-                    "title": scraped.get("title") or result.get("title", ""),
-                    "search_query": search_query,
-                    "scraped_at": datetime.now().isoformat(),
-                    "quality_score": score_source(url)
-                }
-                chunks_added = knowledge_base.add_content(scraped["content"], metadata)
-                if chunks_added > 0:
-                    scraped_count += 1
-        
-        logger.info(f"Scraped and indexed {scraped_count} pages")
+
+        index_tasks = []
+        for url, raw in zip(urls_to_scrape, scrape_results_raw):
+            if isinstance(raw, Exception):
+                logger.warning(f"Scrape raised exception for {url}: {raw}")
+                continue
+            if raw and raw.get("content"):
+                index_tasks.append(_index_page(url, raw))
+
+        if index_tasks:
+            index_results = await asyncio.gather(*index_tasks, return_exceptions=True)
+            scraped_count = sum(
+                1 for r in index_results
+                if not isinstance(r, Exception) and isinstance(r, int) and r > 0
+            )
+
+        logger.info(f"Scraped and indexed {scraped_count} pages (parallel)")
     
     # Step 3: Conversation context already fetched, context preference already fetched
     
@@ -1036,8 +1266,7 @@ async def process_query(request: QueryRequest, background_tasks: BackgroundTasks
         end = raw_answer.find("<<END_DISAMBIGUATION>>")
         disambiguation_content = raw_answer[start:end].strip()
         
-        # Parse options using regex
-        import re
+        # Parse options using regex (re is imported at the top of the file)
         option_pattern = r'\[\[OPTION:\s*([^\]]+)\]\]'
         options = re.findall(option_pattern, disambiguation_content)
         disambiguation_options = [opt.strip() for opt in options]
@@ -1096,10 +1325,188 @@ async def process_query(request: QueryRequest, background_tasks: BackgroundTasks
         answer=answer_text,
         source_links=source_links[:10],  # Limit sources
         source_documents=source_documents[:5],
-        search_query=search_query,
+        search_query=search_queries[0] if search_queries else user_query,
         is_ambiguous=is_ambiguous,
         disambiguation_options=disambiguation_options
     )
+
+
+@app.post("/api/stream")
+async def process_query_stream(request: QueryRequest):
+    """
+    SSE Streaming Endpoint for real-time response generation and pipeline transparency events.
+    """
+    if request.model and request.model != getattr(knowledge_base, "current_model", None):
+        knowledge_base.set_model(request.model)
+
+    user_query = request.query.strip()
+    user_id = request.user_id
+    force_refresh = request.force_refresh
+
+    async def event_generator():
+        loop = asyncio.get_event_loop()
+
+        yield f"data: {json.dumps({'type': 'thinking', 'step': 'analyze', 'message': 'Analyzing query intent & context...'})}\n\n"
+        
+        conversation_context = get_conversation_context(user_id) if user_id else ""
+        context_preference = get_context_preference(user_id) if user_id else None
+        
+        analyzer = get_query_analyzer()
+        analysis = None
+        if analyzer:
+            analysis = await loop.run_in_executor(
+                executor, analyzer.analyze, user_query, conversation_context
+            )
+            
+        search_queries = []
+        requires_web_search = True
+        if analysis:
+            requires_web_search = analysis.requires_web_search
+            if analysis.is_complex and analysis.sub_queries:
+                search_queries = analysis.sub_queries
+                sub_str = ", ".join(search_queries)
+                yield f"data: {json.dumps({'type': 'thinking', 'step': 'decompose', 'message': f'Decomposed query into sub-queries: [{sub_str}]'})}\n\n"
+            else:
+                search_queries = [analysis.optimized_search_query]
+        else:
+            # QueryAnalyzer not ready — try QueryDecomposer as lightweight fallback
+            decomposer = get_query_decomposer()
+            if decomposer:
+                decomp = await loop.run_in_executor(
+                    executor, decomposer.decompose, user_query, conversation_context
+                )
+                if decomp.is_complex and decomp.sub_queries:
+                    search_queries = [sq.query for sq in decomp.sub_queries]
+                    sub_str = ", ".join(search_queries)
+                    yield f"data: {json.dumps({'type': 'thinking', 'step': 'decompose', 'message': f'Decomposed into {len(search_queries)} sub-queries: [{sub_str}]'})}\n\n"
+                else:
+                    search_queries = [user_query]
+            else:
+                search_queries = [user_query]
+
+
+        search_results = []
+        if requires_web_search and search_queries:
+            yield f"data: {json.dumps({'type': 'thinking', 'step': 'search', 'message': f'Searching web for {len(search_queries)} queries in parallel...'})}\n\n"
+            search_tasks = [
+                loop.run_in_executor(executor, web_searcher.search, sq, MAX_SEARCH_RESULTS)
+                for sq in search_queries
+            ]
+            results_lists = await asyncio.gather(*search_tasks, return_exceptions=True)
+            seen_urls = set()
+            for res_list in results_lists:
+                if isinstance(res_list, list):
+                    for item in res_list:
+                        u = item.get("url")
+                        if u and u not in seen_urls:
+                            seen_urls.add(u)
+                            search_results.append(item)
+
+        if search_results:
+            search_results.sort(key=lambda r: score_source(r.get("url", "")), reverse=True)
+            urls_to_scrape = [r["url"] for r in search_results[:MAX_SCRAPE_PAGES] if r.get("url")]
+            
+            yield f"data: {json.dumps({'type': 'thinking', 'step': 'scrape', 'message': f'Scraping {len(urls_to_scrape)} top sources in parallel...'})}\n\n"
+            
+            scrape_tasks = [
+                loop.run_in_executor(executor, scraper.scrape, url, force_refresh)
+                for url in urls_to_scrape
+            ]
+            scrape_results_raw = await asyncio.gather(*scrape_tasks, return_exceptions=True)
+            
+            url_to_result = {r.get("url", ""): r for r in search_results}
+            
+            async def _index(u: str, sc: dict):
+                orig = url_to_result.get(u, {})
+                meta = {
+                    "source": u,
+                    "title": sc.get("title") or orig.get("title", ""),
+                    "search_query": search_queries[0] if search_queries else user_query,
+                    "scraped_at": datetime.now().isoformat(),
+                    "quality_score": score_source(u),
+                }
+                return await loop.run_in_executor(executor, knowledge_base.add_content, sc["content"], meta)
+                
+            index_tasks = []
+            for u, raw in zip(urls_to_scrape, scrape_results_raw):
+                if not isinstance(raw, Exception) and raw and raw.get("content"):
+                    index_tasks.append(_index(u, raw))
+            if index_tasks:
+                await asyncio.gather(*index_tasks, return_exceptions=True)
+
+        yield f"data: {json.dumps({'type': 'thinking', 'step': 'retrieve', 'message': '3-lane retrieval (FAISS + HyDE + BM25) & CRAG relevance grading...'})}\n\n"
+        
+        rag_result = await loop.run_in_executor(
+            executor,
+            knowledge_base.hybrid_query,
+            user_query,
+            conversation_context,
+            context_preference,
+        )
+
+        source_documents = []
+        source_links = []
+        seen_sources = set()
+        for doc in rag_result.get("source_documents", []):
+            src = doc.metadata.get("source", "")
+            if src and src not in seen_sources and src != "system":
+                seen_sources.add(src)
+                source_links.append(src)
+                source_documents.append({"source": src, "content": doc.page_content[:500], "title": doc.metadata.get("title")})
+                
+        for res in search_results:
+            u = res.get("url", "")
+            if u and u not in seen_sources:
+                seen_sources.add(u)
+                source_links.append(u)
+
+        yield f"data: {json.dumps({'type': 'sources', 'source_links': source_links[:10], 'source_documents': source_documents[:5]})}\n\n"
+
+        packed_chunks = rag_result.get("packed_chunks", [])
+        prompt = knowledge_base.prompt_builder.build(
+            query=user_query,
+            packed_chunks=packed_chunks,
+            conversation_context=conversation_context,
+            context_preference=context_preference,
+        )
+        
+        full_response_text = ""
+        yield f"data: {json.dumps({'type': 'thinking', 'step': 'generating', 'message': 'Generating answer...'})}\n\n"
+        
+        try:
+            async for chunk in knowledge_base.llm.astream(prompt):
+                token = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                if token:
+                    full_response_text += token
+                    yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+        except Exception as e:
+            err_str = str(e)
+            logger.warning(f"astream failed ({err_str})")
+            if "429" in err_str or "Quota" in err_str or "ResourceExhausted" in err_str:
+                fallback_model = "gemini-2.5-flash" if knowledge_base.current_model != "gemini-2.5-flash" else "gemini-1.5-pro"
+                logger.info(f"🔄 429 Quota Exceeded on {knowledge_base.current_model} — automatically falling back to {fallback_model}")
+                yield f"data: {json.dumps({'type': 'thinking', 'step': 'generating', 'message': f'Quota exceeded on current model. Switching to fallback ({fallback_model})...'})}\n\n"
+                try:
+                    knowledge_base.set_model(fallback_model)
+                    async for chunk in knowledge_base.llm.astream(prompt):
+                        token = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                        if token:
+                            full_response_text += token
+                            yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+                except Exception as fb_err:
+                    logger.error(f"Fallback model also failed: {fb_err}")
+                    full_response_text = "⚠️ Gemini API rate limit reached. Please wait 30 seconds or select another model in the dropdown above."
+                    yield f"data: {json.dumps({'type': 'token', 'token': full_response_text})}\n\n"
+            else:
+                full_response_text = rag_result.get("result", "")
+                yield f"data: {json.dumps({'type': 'token', 'token': full_response_text})}\n\n"
+
+        if user_id and full_response_text:
+            add_to_memory(user_id, user_query, full_response_text)
+            
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/api/clear-cache")
@@ -1113,6 +1520,50 @@ def clear_cache():
         return {"status": "ok", "files_deleted": count}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/models")
+def get_available_models():
+    """Get available Gemini models and active model."""
+    current_model = getattr(knowledge_base, "current_model", GEMINI_MODEL_NAME)
+    return {
+        "status": "ok",
+        "current_model": current_model,
+        "models": AVAILABLE_MODELS
+    }
+
+
+@app.post("/api/set-model")
+def set_active_model(request: SetModelRequest):
+    """Switch active LLM model."""
+    valid_ids = [m["id"] for m in AVAILABLE_MODELS]
+    if request.model not in valid_ids:
+        return {"status": "error", "message": f"Invalid model. Choose from: {valid_ids}"}
+    
+    success = knowledge_base.set_model(request.model)
+    if success:
+        return {"status": "ok", "message": f"Active model set to {request.model}", "current_model": request.model}
+    else:
+        return {"status": "error", "message": f"Failed to switch to model {request.model}"}
+
+
+@app.get("/api/saver-mode")
+def get_saver_mode():
+    """Get current API Saver Mode status."""
+    return {"status": "ok", "api_saver_mode": API_SAVER_MODE}
+
+
+class SaverModeRequest(BaseModel):
+    enabled: bool
+
+@app.post("/api/set-saver-mode")
+def set_saver_mode(request: SaverModeRequest):
+    """Dynamically toggle RAG Mode between Normal mode and DiveX mode."""
+    global API_SAVER_MODE
+    API_SAVER_MODE = request.enabled
+    mode_name = "Normal mode (1 call/query)" if API_SAVER_MODE else "DiveX mode (4 calls/query)"
+    logger.info("RAG Mode updated dynamically to: %s", mode_name)
+    return {"status": "ok", "api_saver_mode": API_SAVER_MODE, "mode_name": mode_name, "message": f"Switched to {mode_name}"}
 
 
 @app.post("/api/clear-memory")
@@ -1172,9 +1623,65 @@ def submit_feedback(request: FeedbackRequest):
         return {"status": "error", "message": str(e)}
 
 
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    Multimodal Upload Endpoint:
+    Processes uploaded images (PNG/JPG/WEBP) or PDF documents using Gemini Vision / PyPDF,
+    extracts visual and textual context, and indexes into knowledge base.
+    """
+    if not knowledge_base.multimodal_processor:
+        return {"status": "error", "message": "Multimodal processor not initialized"}
+    
+    try:
+        content = await file.read()
+        filename = file.filename or "uploaded_file"
+        
+        loop = asyncio.get_event_loop()
+        if file.content_type and file.content_type.startswith("image/"):
+            result = await loop.run_in_executor(
+                executor, knowledge_base.multimodal_processor.process_image, content, filename
+            )
+        elif file.content_type == "application/pdf" or filename.endswith(".pdf"):
+            result = await loop.run_in_executor(
+                executor, knowledge_base.multimodal_processor.process_pdf, content, filename
+            )
+        else:
+            return {"status": "error", "message": f"Unsupported file type: {file.content_type}"}
+
+        # Index extracted content into knowledge base
+        meta = {
+            "source": f"upload://{filename}",
+            "title": filename,
+            "scraped_at": datetime.now().isoformat(),
+            "quality_score": 1.0,
+            "type": "user_upload"
+        }
+        await loop.run_in_executor(
+            executor, knowledge_base.add_content, result["content"], meta
+        )
+
+        return {
+            "status": "ok",
+            "filename": filename,
+            "description": result.get("description", ""),
+            "indexed": True
+        }
+    except Exception as e:
+        logger.error(f"Upload processing failed for {file.filename}: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/traces")
+def get_traces(limit: int = 50):
+    """Observability endpoint returning recent pipeline trace execution logs."""
+    return {"status": "ok", "traces": get_recent_traces(limit=limit)}
+
+
 @app.post("/api/optimize-sources")
 def optimize_sources():
     """Run the MLOps background job to adjust domain trust scores based on feedback."""
+
     try:
         global TRUSTED_DOMAINS
         updated_domains = feedback_loop_mgr.run_optimization_job(TRUSTED_DOMAINS)
@@ -1185,6 +1692,54 @@ def optimize_sources():
             "message": "Optimization completed. Domain scores updated.",
             "trusted_domains": TRUSTED_DOMAINS
         }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload an image or document for multimodal vision analysis & knowledge indexing."""
+    try:
+        temp_dir = PROCESSED_DIR / "uploads"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        file_path = temp_dir / f"{int(time.time())}_{file.filename}"
+
+        content = await file.read()
+        file_path.write_bytes(content)
+
+        loop = asyncio.get_event_loop()
+        description = await loop.run_in_executor(
+            executor, multimodal_processor.process_image, str(file_path)
+        )
+
+        if description:
+            meta = {
+                "source": f"file://{file.filename}",
+                "title": f"Uploaded Visual: {file.filename}",
+                "scraped_at": datetime.now().isoformat(),
+                "quality_score": 10
+            }
+            await loop.run_in_executor(
+                executor, knowledge_base.add_content, description, meta
+            )
+
+        return {
+            "status": "ok",
+            "filename": file.filename,
+            "image_url": str(file_path),
+            "description_extracted": bool(description)
+        }
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/traces")
+def get_traces(limit: int = 20):
+    """Get recent observability pipeline execution traces."""
+    try:
+        traces = tracer.get_recent_traces(limit=limit)
+        return {"status": "ok", "count": len(traces), "traces": traces}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

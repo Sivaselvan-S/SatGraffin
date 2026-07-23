@@ -147,7 +147,7 @@ Clears all cached scraped content.
 ### Backend
 ```bash
 cd backend
-pip install -r requirements_new.txt
+pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 

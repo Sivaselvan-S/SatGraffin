@@ -7,14 +7,15 @@ import { MessageBubble } from './components/MessageBubble'
 import { LoadingDots } from './components/LoadingDots'
 import { StatusBar } from './components/StatusBar'
 import { useChatHistory } from './hooks/useChatHistory'
-import type { ChatMessage, QueryResponse } from './types'
+import { useStreamingQuery } from './hooks/useStreamingQuery'
+import type { ChatMessage, ThinkingStep } from './types'
 import './styles/app.css'
 
 const DEFAULT_ASSISTANT_MESSAGE: ChatMessage = {
   id: 'assistant-welcome',
   role: 'assistant',
   content:
-    'Hello! I am **SatGraffin**, your AI research assistant. 🚀\n\nAsk me anything and I\'ll:\n- 🔍 Search the web in real-time\n- 📊 Analyze reliable sources\n- ✅ Provide accurate, well-sourced answers\n\nNo hallucinations — just facts backed by sources.',
+    'Hello! I am **SatGraffin v3.0**, your Industrial Agentic RAG assistant. 🚀\n\nFeatures enabled:\n- ⚡ **Real-time SSE Streaming** response\n- 🔍 **Sub-query decomposition** & parallel web retrieval\n- 🎯 **HyDE** & **CRAG** relevance grading\n- 🖼️ **Multimodal image & document reasoning**',
   createdAt: Date.now(),
 }
 
@@ -23,10 +24,8 @@ const USER_ID_KEY = 'satgraffin.user.id'
 
 function getOrCreateUserId(): string {
   if (typeof window === 'undefined') return `web-${Date.now()}`
-  
   const stored = localStorage.getItem(USER_ID_KEY)
   if (stored) return stored
-  
   const newId = typeof crypto !== 'undefined' && 'randomUUID' in crypto 
     ? crypto.randomUUID() 
     : `web-${Date.now()}`
@@ -51,78 +50,116 @@ function App() {
   const [isLoading, setIsLoading] = useState(false)
   const [pendingPrompt, setPendingPrompt] = useState<string | undefined>()
   const [lastUserQuery, setLastUserQuery] = useState<string | undefined>()
+  const [selectedModel, setSelectedModel] = useState<string>(() => {
+    const stored = localStorage.getItem('satgraffin.selected_model')
+    return (stored && stored !== 'gemini-1.5-flash') ? stored : 'gemini-2.0-flash'
+  })
   const scrollContainerRef = useRef<HTMLDivElement | null>(null)
 
   const { messages, setMessages, clearHistory, hasHistory } = useChatHistory([DEFAULT_ASSISTANT_MESSAGE])
+  const { streamQuery } = useStreamingQuery()
   const userId = getOrCreateUserId()
 
   useEffect(() => {
     const container = scrollContainerRef.current
-    if (!container) {
-      return
-    }
+    if (!container) return
     container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' })
   }, [messages, isLoading])
 
-  const sendMessage = async (text: string) => {
+  const sendMessage = async (text: string, file?: File) => {
     const trimmed = text.trim()
-    if (!trimmed) {
-      return
+    if (!trimmed && !file) return
+
+    const queryText = trimmed || (file ? `Analyze uploaded file: ${file.name}` : '')
+    setLastUserQuery(queryText)
+    
+    const userMessage = createMessage('user', queryText)
+    if (file) {
+      userMessage.imageUrl = URL.createObjectURL(file)
     }
 
-    setLastUserQuery(trimmed)
-    const userMessage = createMessage('user', trimmed)
-    setMessages((prev) => [...prev, userMessage])
-    setPendingPrompt(undefined)
+    const assistantId = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `assistant-${Date.now()}`
+    const assistantMessage: ChatMessage = {
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      createdAt: Date.now(),
+      query: queryText,
+      thinkingSteps: [],
+      isStreaming: true,
+    }
 
+    setMessages((prev) => [...prev, userMessage, assistantMessage])
+    setPendingPrompt(undefined)
     setIsLoading(true)
     setStatus('connecting')
     setError(undefined)
 
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/query`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
+    await streamQuery(
+      queryText,
+      {
+        apiBaseUrl: API_BASE_URL,
+        userId,
+        model: selectedModel,
+        onThinkingStep: (step: ThinkingStep) => {
+          setMessages((prev) =>
+            prev.map((msg) => {
+              if (msg.id === assistantId) {
+                const currentSteps = msg.thinkingSteps || []
+                return {
+                  ...msg,
+                  thinkingSteps: [...currentSteps, step],
+                }
+              }
+              return msg
+            })
+          )
         },
-        body: JSON.stringify({ query: trimmed, user_id: userId }),
-      })
-
-      if (!response.ok) {
-        throw new Error(`Request failed with status ${response.status}`)
-      }
-
-      const data = (await response.json()) as QueryResponse
-      const assistantMessage = createMessage('assistant', data.response, data.source_links ?? [])
-      assistantMessage.query = trimmed
-      
-      // Add disambiguation info if present
-      if (data.is_ambiguous && data.disambiguation_options) {
-        assistantMessage.isAmbiguous = true
-        assistantMessage.disambiguationOptions = data.disambiguation_options
-      }
-      
-      setMessages((prev) => [...prev, assistantMessage])
-      setStatus('success')
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unexpected error'
-      setStatus('error')
-      setError(message)
-
-      const fallback = createMessage(
-        'assistant',
-        '⚠️ I ran into a connectivity issue while reaching the knowledge store.\n\nPlease check your connection and try again.',
-      )
-      fallback.isError = true
-      setMessages((prev) => [...prev, fallback])
-    } finally {
-      setIsLoading(false)
-    }
+        onSources: (sources: string[]) => {
+          setMessages((prev) =>
+            prev.map((msg) => (msg.id === assistantId ? { ...msg, sources } : msg))
+          )
+        },
+        onToken: (token: string) => {
+          setStatus('success')
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantId
+                ? { ...msg, content: msg.content + token }
+                : msg
+            )
+          )
+        },
+        onError: (errMessage: string) => {
+          setStatus('error')
+          setError(errMessage)
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantId
+                ? {
+                    ...msg,
+                    content: '⚠️ I ran into a connection error while processing your request. Please try again.',
+                    isError: true,
+                    isStreaming: false,
+                  }
+                : msg
+            )
+          )
+        },
+        onDone: () => {
+          setIsLoading(false)
+          setStatus('idle')
+          setMessages((prev) =>
+            prev.map((msg) => (msg.id === assistantId ? { ...msg, isStreaming: false } : msg))
+          )
+        },
+      },
+      file
+    )
   }
 
   const handleRetry = () => {
     if (lastUserQuery) {
-      // Remove the last error message
       setMessages((prev) => prev.slice(0, -1))
       sendMessage(lastUserQuery)
     }
@@ -136,18 +173,16 @@ function App() {
     try {
       const response = await fetch(`${API_BASE_URL}/api/set-context`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_id: userId, selected_context: context }),
       })
-
       if (!response.ok) {
         console.error('Failed to set context preference')
         return
       }
-
-      console.log(`Context preference set to: ${context}`)
+      if (lastUserQuery) {
+        sendMessage(lastUserQuery)
+      }
     } catch (err) {
       console.error('Error setting context:', err)
     }
@@ -161,7 +196,7 @@ function App() {
   }
 
   const handleFeedback = async (message: ChatMessage, isThumbsUp: boolean) => {
-    if (!message.query) return;
+    if (!message.query) return
     try {
       await fetch(`${API_BASE_URL}/api/feedback`, {
         method: 'POST',
@@ -170,18 +205,23 @@ function App() {
           query: message.query,
           answer: message.content,
           source_links: message.sources || [],
-          is_thumbs_up: isThumbsUp
+          is_thumbs_up: isThumbsUp,
         }),
-      });
+      })
     } catch (err) {
-      console.error('Failed to submit feedback', err);
+      console.error('Failed to submit feedback', err)
     }
-  };
+  }
 
   return (
     <div className="app-shell">
       <div className="app-shell__background" aria-hidden />
-      <Header />
+      <Header
+        apiBaseUrl={API_BASE_URL}
+        selectedModel={selectedModel}
+        onSelectModel={setSelectedModel}
+        disabled={isLoading}
+      />
       <StatusBar status={status} message={error} />
 
       <section className="chat-panel">
@@ -204,7 +244,7 @@ function App() {
               {isLoading && (
                 <li className="chat-panel__loading">
                   <LoadingDots />
-                  <span>Searching the web and analyzing sources…</span>
+                  <span>Processing sub-queries and synthesizing response…</span>
                 </li>
               )}
             </ul>
@@ -229,7 +269,7 @@ function App() {
 
       <footer className="app-footer">
         <p>
-          Responses are grounded in real-time web search and analysis. All answers include source links for verification.
+          SatGraffin v3.0 Industrial Agentic RAG. Answers are grounded in real-time multi-lane retrieval and streaming synthesis.
         </p>
       </footer>
     </div>

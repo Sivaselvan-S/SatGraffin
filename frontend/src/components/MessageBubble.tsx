@@ -7,6 +7,7 @@ import remarkGfm from 'remark-gfm'
 import type { ChatMessage } from '../types'
 import { SourceLinks } from './SourceLinks'
 import { ContextSelector } from './ContextSelector'
+import { ThinkingSteps } from './ThinkingSteps'
 
 interface MessageBubbleProps {
   message: ChatMessage
@@ -25,6 +26,30 @@ export const MessageBubble = memo(function MessageBubble({
   const [copied, setCopied] = useState(false)
   const [feedbackState, setFeedbackState] = useState<'up' | 'down' | null>(null)
 
+  // Process raw disambiguation markers if present in assistant response
+  let displayContent = message.content
+  let isAmbiguous = message.isAmbiguous
+  let disambiguationOptions = message.disambiguationOptions
+
+  if (!isUser && displayContent.includes('<<DISAMBIGUATION>>') && displayContent.includes('<<END_DISAMBIGUATION>>')) {
+    isAmbiguous = true
+    const start = displayContent.indexOf('<<DISAMBIGUATION>>') + '<<DISAMBIGUATION>>'.length
+    const end = displayContent.indexOf('<<END_DISAMBIGUATION>>')
+    const disContent = displayContent.slice(start, end).trim()
+
+    if (!disambiguationOptions || disambiguationOptions.length === 0) {
+      const optionPattern = /\[\[OPTION:\s*([^\]]+)\]\]/g
+      const options: string[] = []
+      let match
+      while ((match = optionPattern.exec(disContent)) !== null) {
+        if (match[1]) options.push(match[1].trim())
+      }
+      disambiguationOptions = options
+    }
+
+    displayContent = disContent.replace(/\[\[OPTION:\s*([^\]]+)\]\]/g, '**$1:**').trim()
+  }
+
   const handleFeedbackClick = (isUp: boolean) => {
     if (feedbackState) return;
     setFeedbackState(isUp ? 'up' : 'down');
@@ -33,7 +58,7 @@ export const MessageBubble = memo(function MessageBubble({
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(message.content)
+      await navigator.clipboard.writeText(displayContent)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch (err) {
@@ -63,7 +88,11 @@ export const MessageBubble = memo(function MessageBubble({
           {isUser ? (
             <p>{message.content}</p>
           ) : (
-            <ReactMarkdown
+            <>
+              {message.thinkingSteps && message.thinkingSteps.length > 0 && (
+                <ThinkingSteps steps={message.thinkingSteps} isStreaming={message.isStreaming} />
+              )}
+              <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               components={{
                 // Custom styling for markdown elements
@@ -92,8 +121,9 @@ export const MessageBubble = memo(function MessageBubble({
                 blockquote: ({ children }) => <blockquote className="markdown-blockquote">{children}</blockquote>,
               }}
             >
-              {message.content}
+              {displayContent}
             </ReactMarkdown>
+            </>
           )}
         </div>
         
@@ -154,9 +184,9 @@ export const MessageBubble = memo(function MessageBubble({
         )}
 
         {/* Context Selector for ambiguous responses */}
-        {!isUser && message.isAmbiguous && message.disambiguationOptions && message.disambiguationOptions.length > 0 && (
+        {!isUser && isAmbiguous && disambiguationOptions && disambiguationOptions.length > 0 && (
           <ContextSelector
-            options={message.disambiguationOptions}
+            options={disambiguationOptions}
             onSelect={(context) => onContextSelect?.(context)}
           />
         )}
