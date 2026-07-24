@@ -1,0 +1,25 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="128" height="128" rx="32" fill="url(#a)" />
+  <g filter="url(#b)">
+    <path
+      d="M44 80c0-12.15 9.85-22 22-22 7.4 0 13.92 3.72 17.88 9.54L108 52l-7.72-7.72 5.24-5.24-12.28-12.28-5.24 5.24L80 24 52.46 51.54A21.93 21.93 0 0 0 44 58.84V80Z"
+      stroke="#F8FAFC"
+      stroke-width="6"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+    <circle cx="66" cy="78" r="14" stroke="#F8FAFC" stroke-width="6" />
+  </g>
+  <defs>
+    <linearGradient id="a" x1="18" y1="14" x2="110" y2="114" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2563EB" />
+      <stop offset="0.5" stop-color="#8B5CF6" />
+      <stop offset="1" stop-color="#EC4899" />
+    </linearGradient>
+    <filter id="b" x="28" y="24" width="96" height="80" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix" />
+      <feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape" />
+      <feGaussianBlur stdDeviation="1.5" result="effect1_foregroundBlur" />
+    </filter>
+  </defs>
+</svg>
